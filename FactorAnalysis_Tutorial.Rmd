@@ -1,0 +1,306 @@
+---
+title: "slalom, PLIER and other matrix factorization methods"
+author: "Ricardo Ramirez"
+date: "8/12/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### Pathway-Level Information ExtractoR (PLIER) (Mao, et al. 2017)
+
+When to use?: Inference of cell-type proportion or pathway activities
+
+PLIER approximates the expression pattern of every gene as a linear combination of eigengene-like latent variables (LVs). 
+
+Note: This representation is the common framework of Factor Analysis
+
+In constructing LVs, PLIER surveys a large compendium of prior knowl- edge (genesets) and produces a dataset deconvolution that optimizes alignment of LVs to a relevant subset of the available genesets. By integrating dataset deconvolution with prior knowledge, this process reduces technical noise, increases statistical power, and identifies the specific *upstream* pathways or cell type proportion changes driving the geneset-aligned signals.
+
+In the original paper PLIER outperformed model-based approaches of cell-type inference such as *Cibersort*
+
+In PLIER terms, B is a matrix of LVs values for each sample (pathway activity estimation),Z are the loadings of each gene for each latent variable that are calculating by a matrix multiplication of the prior knowledge with a sparse matrix (U). 
+
+A good observation in the paper is that as biological information gets noisier, the usefulness of this method decreases. In conclusion, informative, and medium size pathways work better.
+
+PLIER operates best on z-scored data and thus by default discards valuable information about total transcript abundance.
+
+PLIER cannot be applied for mixture component estimation in datasets with just a few samples, where model-based methods should have a clear advantage
+
+*WARNING: the model asummes positive correlation. "We also restrict U and Z to be positive, which enforces that genes belonging to a single geneset are positively correlated with each other and the loadings are positively correlated with the prior information."*
+
+A simple test... with PROGENy + Heart Failure Data
+
+```{r,warning=F,message=F}
+library(PLIER)
+library(progeny)
+library(limma)
+library(tidyverse)
+
+load("results/METAheart.ro") #Object with MetaAnalysis experiments
+#load("data/zscores_progeny.RData") #Object with MetaAnalysis experiments
+#PROGENy_model = zscores
+
+PROGENy = sign(model)
+
+negPROGENy = apply((PROGENy == -1),2,as.numeric)
+rownames(negPROGENy) = rownames(PROGENy)
+colnames(negPROGENy) = paste(colnames(negPROGENy),"neg",sep = "")
+
+posPROGENy = apply((PROGENy == 1),2,as.numeric)
+rownames(posPROGENy) = rownames(PROGENy)
+colnames(posPROGENy) = paste(colnames(posPROGENy),"pos",sep = "")
+
+```
+
+```{r}
+#Defining the collection of gene sets
+
+exprs.mat = METAheart$GSE57345$GEX[names(sort(apply(METAheart$GSE57345$GEX,1,var),decreasing = T))[1:4000],]
+
+all.paths = PLIER::combinePaths(negPROGENy, posPROGENy)
+
+cm.genes = PLIER::commonRows(all.paths, exprs.mat)
+  
+# row normalize: Required in PLIER
+exprs.norm <- PLIER::rowNorm(exprs.mat)
+  
+# what should we set the minimum k parameter to in PLIER? estimate the number 
+# of PC for the SVD decomposition 
+set.k <- PLIER::num.pc(exprs.norm[cm.genes, ])
+  
+# PLIER main function + return results
+plier.res <- PLIER::PLIER(exprs.norm[cm.genes, ], all.paths[cm.genes, ], 
+                          k = round((set.k + set.k * 0.3), 0), trace = F)
+```
+
+### Showing the U matrix (Sparse Matrix)
+
+```{r}
+plotU(plier.res,auc.cutoff = 0.7,fdr.cutoff = 0.1,top = 5)
+```
+
+### Showing partial loadings
+
+```{r}
+plotTopZ(plier.res,exprs.norm, all.paths,top = 15, index = c(15,48,74,69,65,71))
+```
+
+
+### Observing most informative variables / Annotated
+
+The AUC and the p_val summarize the information of pathway association with latent variables, high AUC and low p-val
+
+```{r}
+dplyr::filter(plier.res$summary, AUC > 0.7 & FDR < 0.1) %>% arrange(desc(AUC))
+```
+
+Let's associate each LV with Heart Failure
+
+```{r}
+targets = METAheart$GSE57345$TARGETS
+
+PLIER_assoc = as.data.frame(t(apply(plier.res$B[,targets$Sample],1, function(x){
+              lm.model = summary(lm(x ~ targets$HeartFailure))
+              return(lm.model$coefficients[2,c(3,4)])
+            }))) %>% rownames_to_column("LV")
+
+colnames(PLIER_assoc) = c("LV","t","p_value")
+
+PLIER_assoc %>% filter(p_value <= 0.01) %>% arrange(desc(abs(t)))
+
+```
+
+### Plotting the results
+
+```{r}
+plotPLIER_LV = function(indexes,target.df, plier.res){
+  B_mat = plier.res$B
+  LV_names = rownames(B_mat)
+  LVs = LV_names[indexes]
+  B_gathered = as.data.frame(B_mat) %>% rownames_to_column("LV") %>% gather("Sample","B",-LV) %>%
+               left_join(target.df, by = "Sample")
+  
+  B_filtered = dplyr::filter(B_gathered, LV %in% LV_names[indexes]) %>% spread("LV","B")
+  
+  B_plot = ggplot(B_filtered, aes(x=B_filtered[[LVs[1]]],
+                                  y=B_filtered[[LVs[2]]],
+                                  color = HeartFailure)) + 
+           geom_point() + theme_minimal() + xlab(LVs[1]) +
+           ylab(LVs[2])
+  
+  print(B_plot)
+}
+```
+
+# The distribution of samples is influenced by pathway annotation
+
+```{r}
+plotPLIER_LV(indexes = c(69,92),target.df = METAheart$GSE57345$TARGETS,plier.res = plier.res)
+```
+
+```{r}
+plotPLIER_LV(indexes = c(14,79),target.df = METAheart$GSE57345$TARGETS,plier.res = plier.res)
+```
+
+```{r}
+plotPLIER_LV(indexes = c(65,54),target.df = METAheart$GSE57345$TARGETS,plier.res = plier.res)
+```
+
+
+## f-scLVM (Factorial single-cell latent variable model) aka slalom (Buettner, et al. 2017)
+
+from the paper... (Bayesian inference)
+
+"The model jointly infers factors that cap- ture different sources of single-cell transcriptome variation, including i) variation in expression attribut- able to pre-annotated gene sets and ii) effects due to additional sparse factors that explain putatively meaningful biological effects. In addition to these biological factors, our model also infers likely confounding factors that are expected to affect the expression profile of the majority of genes.
+
+As well as identifying new factors and updating exist- ing factor annotation, our model also infers which fac- tors explain variability in the given dataset."
+
+When to use?: Designed for scRNA-seq, but may work for bulk (Gaussian Error). I haven't found where to specify it.
+
+Compared to PLIER, slalom is a strictly sparse factor analysis, in which each factor is indeed the specified gene set.
+
+```{r, message=F, warning=F}
+library(GSEABase)
+library(SingleCellExperiment)
+library(slalom)
+library(scater)
+library(edgeR)
+```
+
+```{r}
+model_extended = cbind(posPROGENy,negPROGENy)
+
+model_extended = model_extended[,colSums(model_extended)>0]
+
+PROGENY_paths = colnames(model_extended)
+names(PROGENY_paths) = PROGENY_paths
+
+genesets <- GSEABase::GeneSetCollection(
+  
+lapply(PROGENY_paths, function(x){
+  genes = rownames(model_extended[model_extended[,x]!=0,])
+  if(!is.null(genes)){
+    GeneSet(setName = x, 
+            rownames(model_extended[model_extended[,x]!=0,]),
+            geneIdType=SymbolIdentifier())
+  }
+})
+
+)
+
+```
+
+```{r}
+TestExprmat_var = SingleCellExperiment(assays = list(logcounts = exprs.mat),
+                                       colData = targets)
+
+m <- newSlalomModel(TestExprmat_var, genesets, n_hidden = 3, min_genes = 5)
+
+m <- initSlalom(m)
+
+#m <- initSlalom(m,pi_prior = pi_prior[m$geneNames,],n_hidden = 2,seed = 222)
+
+mm <- trainSlalom(m, minIterations = 400, nIterations = 15000, shuffle = TRUE,
+                  pretrain = TRUE, seed = 300,verbose = F)
+
+topTerms(mm)
+
+#TestExprmat_var_slalom <- addResultsToSingleCellExperiment(TestExprmat_var, m)
+#B_red_slalom = reducedDim(TestExprmat_var_slalom, "slalom")
+#head(reducedDim(TestExprmat_var_slalom, "slalom")[,1:2])
+```
+
+From slalom we can also obtain the LV matrix
+
+```{r}
+slalomB = mm$X_E1
+colnames(slalomB) = mm$termNames
+rownames(slalomB) = mm$cellNames
+
+PLIER_assoc_slalom = as.data.frame(t(apply(slalomB[targets$Sample,],2, function(x){
+              lm.model = summary(lm(x ~ targets$HeartFailure))
+              return(lm.model$coefficients[2,c(3,4)])
+            }))) %>% rownames_to_column("LV")
+
+colnames(PLIER_assoc_slalom) = c("LV","t","p_value")
+
+PLIER_assoc_slalom %>% filter(p_value <= 0.05) %>% arrange(desc(abs(t)))
+```
+
+
+```{r}
+plotslalom_LV = function(indexes,target.df, B_mat){
+  B_mat = t(B_mat)
+  LV_names = rownames(B_mat)
+  #LVs = LV_names[indexes]
+  B_gathered = as.data.frame(B_mat) %>% rownames_to_column("LV") %>% gather("Sample","B",-LV) %>%
+               left_join(target.df, by = "Sample")
+  
+  B_filtered = dplyr::filter(B_gathered, LV %in% indexes) %>% spread("LV","B")
+  
+  B_plot = ggplot(B_filtered, aes(x=B_filtered[[indexes[1]]],
+                                  y=B_filtered[[indexes[2]]],
+                                  color = HeartFailure)) + 
+           geom_point() + theme_minimal() + xlab(indexes[1]) +
+           ylab(indexes[2])
+  
+  print(B_plot)
+}
+
+
+```
+
+```{r}
+plotslalom_LV(indexes = c("MAPKpos","JAK.STATpos"),target.df = targets,B_mat = slalomB)
+```
+
+As a comparison... I picked the same pathways from the PLIER model
+
+```{r}
+plotPLIER_LV(indexes = c(92,69),target.df = METAheart$GSE57345$TARGETS,plier.res = plier.res)
+```
+
+## How similar is this to PROGENy alone?
+
+```{r}
+pos_model = model
+pos_model[pos_model<0] = 0
+
+genesinmodel = rownames(pos_model)[rownames(pos_model) %in% rownames(exprs.mat)]
+
+P_mat = t(exprs.mat[genesinmodel,]) %*% pos_model[genesinmodel,]
+
+plotslalom_LV(indexes = c("MAPK","JAK.STAT"),target.df = targets,B_mat = P_mat)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
